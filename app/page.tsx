@@ -12,54 +12,64 @@ const ICE_SERVERS = {
 
 const SOCKET_URL = 'http://localhost:8080';
 
+type MatchStatus = 'idle' | 'waiting' | 'matched' | 'calling';
+
 export default function Page() {
     const localVideoRef = useRef<HTMLVideoElement>(null);
     const remoteVideoRef = useRef<HTMLVideoElement>(null);
+    const localStreamRef = useRef<MediaStream | null>(null);
 
     const socketRef = useRef<Socket | null>(null);
     const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+    const creatorIdRef = useRef<string>('');
+    const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+    const roomIdRef = useRef<string>('room-1');
+    const [roomId, setRoomId] = useState('room-1');
     const [joined, setJoined] = useState(false);
-    const roomId = 'room-1'; // Fixed room ID for testing 2 persons
+    const [rank, setRank] = useState('1200');
+    const [matchStatus, setMatchStatus] = useState<MatchStatus>('idle');
+    const [countdown, setCountdown] = useState(4);
 
+    // Effect 1: Socket connection — runs ONCE
     useEffect(() => {
-        socketRef.current = io(SOCKET_URL);
+        const socket = io(SOCKET_URL);
+        socketRef.current = socket;
 
-        socketRef.current.on('user-joined', async () => {
-            // Create and send WebRTC Offer when a second user joins
-            if (peerConnectionRef.current) {
-                const offer = await peerConnectionRef.current.createOffer();
-                await peerConnectionRef.current.setLocalDescription(offer);
-                socketRef.current?.emit('offer', { roomId, offer });
-            }
+        socket.on('waiting', () => {
+            setMatchStatus('waiting');
         });
 
-        socketRef.current.on('offer', async ({ offer }) => {
-            // Handle incoming offer, generate answer
+        socket.on('matched', ({ roomId: matchedRoomId, creatorId }) => {
+            roomIdRef.current = matchedRoomId;
+            creatorIdRef.current = creatorId;
+            setRoomId(matchedRoomId);
+            setMatchStatus('matched');
+            setCountdown(4);
+        });
+
+        socket.on('offer', async ({ offer }) => {
             if (peerConnectionRef.current) {
                 await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(offer));
                 const answer = await peerConnectionRef.current.createAnswer();
                 await peerConnectionRef.current.setLocalDescription(answer);
-                socketRef.current?.emit('answer', { roomId, answer });
+                socketRef.current?.emit('answer', { roomId: roomIdRef.current, answer });
             }
         });
 
-        socketRef.current.on('answer', async ({ answer }) => {
-            // Handle incoming answer from remote peer
+        socket.on('answer', async ({ answer }) => {
             if (peerConnectionRef.current) {
                 await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer));
             }
         });
 
-        socketRef.current.on('ice-candidate', async (candidate) => {
-            // Add network candidate from peer
+        socket.on('ice-candidate', async (candidate) => {
             if (peerConnectionRef.current && candidate) {
                 await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
             }
         });
 
-        socketRef.current.on('user-left', () => {
-            // Close the peer connection when the remote user leaves
+        socket.on('user-left', () => {
             const pc = peerConnectionRef.current;
             if (pc) {
                 pc.close();
@@ -68,61 +78,152 @@ export default function Page() {
             if (remoteVideoRef.current) {
                 remoteVideoRef.current.srcObject = null;
             }
+            setMatchStatus('idle');
+            setJoined(false);
+            setCountdown(4);
+            localStreamRef.current = null;
         });
 
         return () => {
-            socketRef.current?.disconnect();
+            socket.disconnect();
             const pc = peerConnectionRef.current;
-            if (pc) {
-                pc.close();
-                peerConnectionRef.current = null;
-            }
+            if (pc) pc.close();
         };
     }, []);
 
-    const startCall = async () => {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+    // Effect 2: Countdown and auto-start WebRTC after 4 seconds
+    useEffect(() => {
+        if (matchStatus !== 'matched') return;
 
-        const pc = new RTCPeerConnection(ICE_SERVERS);
-        peerConnectionRef.current = pc;
+        if (countdown > 0) {
+            timerRef.current = setInterval(() => {
+                setCountdown((c) => (c <= 1 ? 0 : c - 1));
+            }, 1000);
+            return;
+        }
 
-        // Attach local camera tracks to WebRTC connection
-        stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+        const startCallWebRTC = async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
 
-        // Handle remote media stream
-        pc.ontrack = (event) => {
-            if (remoteVideoRef.current) {
-                remoteVideoRef.current.srcObject = event.streams[0];
+                // Store stream so it can be attached once videos are mounted
+                localStreamRef.current = stream;
+
+                const pc = new RTCPeerConnection(ICE_SERVERS);
+                peerConnectionRef.current = pc;
+
+                stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+                pc.ontrack = (event) => {
+                    if (remoteVideoRef.current) {
+                        remoteVideoRef.current.srcObject = event.streams[0];
+                    }
+                };
+
+                pc.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        socketRef.current?.emit('ice-candidate', {
+                            roomId: roomIdRef.current,
+                            candidate: event.candidate,
+                        });
+                    }
+                };
+
+                if (socketRef.current?.id === creatorIdRef.current) {
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    socketRef.current.emit('offer', { roomId: roomIdRef.current, offer });
+                }
+
+                setJoined(true);
+            } catch (err) {
+                console.error('Failed to start call:', err);
+                setMatchStatus('idle');
             }
         };
 
-        // Send local ICE candidates to peer via socket
-        pc.onicecandidate = (event) => {
-            if (event.candidate) {
-                socketRef.current?.emit('ice-candidate', { roomId, candidate: event.candidate });
-            }
-        };
+        startCallWebRTC();
 
-        socketRef.current?.emit('join-room', roomId);
-        setJoined(true);
+        return () => {
+            if (timerRef.current) clearInterval(timerRef.current);
+        };
+    }, [matchStatus, countdown]);
+
+    // Effect 3: Attach local stream once videos are mounted (joined === true)
+    useEffect(() => {
+        if (joined && localStreamRef.current && localVideoRef.current) {
+            localVideoRef.current.srcObject = localStreamRef.current;
+        }
+    }, [joined]);
+
+    const findMatch = () => {
+        socketRef.current?.emit('start-call', { rank: Number(rank) });
+        setMatchStatus('waiting');
     };
 
     return (
         <div style={{ padding: 20, textAlign: 'center' }}>
-            <h1>2-Person Video Call</h1>
-            {!joined && <button onClick={startCall}>Start / Join Call</button>}
+            <h1>Video Call</h1>
 
-            <div style={{ display: 'flex', justifyContent: 'center', gap: 20, marginTop: 20 }}>
-                <div>
-                    <h3>Local Video</h3>
-                    <video ref={localVideoRef} autoPlay playsInline muted style={{ width: '400px', borderRadius: '8px', background: '#000' }} />
+            {matchStatus === 'idle' && (
+                <div style={{ marginBottom: 20 }}>
+                    <label style={{ marginRight: 10 }}>
+                        Rank:{' '}
+                        <input
+                            type="number"
+                            value={rank}
+                            onChange={(e) => setRank(e.target.value)}
+                        />
+                    </label>
+                    <button onClick={findMatch}>Find Match</button>
                 </div>
+            )}
+
+            {matchStatus === 'waiting' && <p>Searching for a player with a similar rank...</p>}
+
+            {matchStatus === 'matched' && (
                 <div>
-                    <h3>Remote Video</h3>
-                    <video ref={remoteVideoRef} autoPlay playsInline style={{ width: '400px', borderRadius: '8px', background: '#000' }} />
+                    <p>Match found! Room: {roomId}</p>
+                    <p>Connecting in {countdown} seconds...</p>
                 </div>
-            </div>
+            )}
+
+            {joined && (
+                <div style={{ marginTop: 20 }}>
+                    <div style={{ display: 'flex', justifyContent: 'center', gap: 40 }}>
+                        <div style={{ textAlign: 'center' }}>
+                            <h3>You</h3>
+                            <video
+                                ref={localVideoRef}
+                                autoPlay
+                                playsInline
+                                muted
+                                style={{
+                                    width: '400px',
+                                    borderRadius: '8px',
+                                    background: '#000',
+                                    border: '2px solid #4ade80',
+                                }}
+                            />
+                        </div>
+                        <div style={{ textAlign: 'center' }}>
+                            <h3>Partner</h3>
+                            <video
+                                ref={remoteVideoRef}
+                                autoPlay
+                                playsInline
+                                style={{
+                                    width: '400px',
+                                    borderRadius: '8px',
+                                    background: '#000',
+                                    border: '2px solid #3b82f6',
+                                }}
+                            />
+                        </div>
+                    </div>
+                    <p>Both users are sharing video with each other.</p>
+                </div>
+            )}
         </div>
     );
 }
